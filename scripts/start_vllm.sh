@@ -10,4 +10,10 @@ MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
 exec uv run python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \
-    --port 8000
+    --port 8000 \
+    --max-model-len 8096 \
+    --enable-expert-parallel \
+    --tensor-parallel-size 1 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3
