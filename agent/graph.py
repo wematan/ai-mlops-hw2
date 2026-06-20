@@ -16,6 +16,7 @@ conditional router following the same shape.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -81,6 +82,29 @@ def _extract_sql(text: str) -> str:
     return (fenced.group(1) if fenced else text).strip()
 
 
+def _parse_verdict(text: str) -> tuple[bool, str]:
+    """Pull {"ok": bool, "issue": str} out of an LLM reply, defensively.
+
+    The model may wrap the JSON in prose or a code fence, so we grab the first
+    object and fall back to a regex on the ok flag. If nothing parses we bias
+    toward revising (ok=false); the iteration cap keeps that bounded.
+    """
+    raw = str(text)
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            obj = json.loads(match.group(0))
+            issue = str(obj.get("issue", "")).strip()
+            return bool(obj.get("ok")), issue
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    flag = re.search(r'"?ok"?\s*[:=]\s*(true|false)', raw, re.IGNORECASE)
+    if flag:
+        ok = flag.group(1).lower() == "true"
+        return ok, "" if ok else "verifier flagged the result"
+    return False, "could not parse verifier output"
+
+
 def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
@@ -124,7 +148,31 @@ def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    execution = state.execution
+    # A failed execution is unambiguously not plausible: short-circuit without
+    # spending an LLM call and hand the error straight to the reviser.
+    if execution is None or not execution.ok:
+        issue = execution.error if (execution and execution.error) else "query produced no result"
+        return {
+            "verify_ok": False,
+            "verify_issue": issue,
+            "history": state.history + [{"node": "verify", "ok": False, "issue": issue}],
+        }
+
+    response = llm().invoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            question=state.question,
+            sql=state.sql,
+            result=execution.render(),
+        )),
+    ])
+    ok, issue = _parse_verdict(response.content)
+    return {
+        "verify_ok": ok,
+        "verify_issue": issue,
+        "history": state.history + [{"node": "verify", "ok": ok, "issue": issue}],
+    }
 
 
 def revise_node(state: AgentState) -> dict:
@@ -137,7 +185,23 @@ def revise_node(state: AgentState) -> dict:
 
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    result_text = state.execution.render() if state.execution else "ERROR: no execution result"
+    response = llm().invoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            result=result_text,
+            issue=state.verify_issue,
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{"node": "revise", "sql": sql, "issue": state.verify_issue}],
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -146,7 +210,9 @@ def route_after_verify(state: AgentState) -> str:
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
     the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------
