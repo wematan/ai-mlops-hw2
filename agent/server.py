@@ -19,16 +19,11 @@ load_dotenv()
 
 from agent.graph import AgentState, graph  # noqa: E402
 
-# Langfuse callback handler. If keys are set we initialize it; failures
-# are NOT swallowed - a misconfigured Langfuse should not silently
-# produce zero traces.
-_lf_handler: Any = None
 _lf_client: Any = None
 if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
-    from langfuse import get_client
+    from langfuse import get_client, propagate_attributes
     from langfuse.langchain import CallbackHandler
 
-    _lf_handler = CallbackHandler()
     _lf_client = get_client()
 
 
@@ -58,24 +53,22 @@ def health() -> dict[str, str]:
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
     state = AgentState(question=req.question, db_id=req.db)
-    metadata: dict[str, Any] = {
-        **req.tags,
-        "db_id": req.db,
-        "langfuse_tags": [f"db:{req.db}"],
-    }
+    handler = CallbackHandler() if _lf_client is not None else None
     config: dict[str, Any] = {
-        "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": metadata,
+        "callbacks": [handler] if handler is not None else [],
+        "metadata": req.tags,
     }
     try:
         if _lf_client is not None:
-            with _lf_client.start_as_current_observation(
-                name="agent_answer", as_type="chain"
-            ):
+            with propagate_attributes(tags=[f"db:{req.db}"], metadata={"db_id": req.db}):
                 final = graph.invoke(state, config=config)
-                rounds = max(int(final.get("iteration", 0)) - 1, 0)
-                _lf_client.score_current_trace(
-                    name="revision_rounds", value=rounds, data_type="NUMERIC"
+            rounds = max(int(final.get("iteration", 0)) - 1, 0)
+            if handler is not None and handler.last_trace_id:
+                _lf_client.create_score(
+                    trace_id=handler.last_trace_id,
+                    name="revision_rounds",
+                    value=rounds,
+                    data_type="NUMERIC",
                 )
         else:
             final = graph.invoke(state, config=config)
